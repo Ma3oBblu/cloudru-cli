@@ -52,6 +52,14 @@ curl -s --data-urlencode "grant_type=client_credentials" \
   `unknown service v1/clusters/…`.
 - **`done: true` в операции ≠ успех**: смотреть `error.message`. Типовые значения:
   `acquire_quota failed` (нет ёмкости), `inappropriate service status: "FAILED"`.
+- **Тело ошибки валидации пустое.** `POST /v1/clusters` на неполном теле отвечает `400` с
+  `content-length: 0`, а текст лежит в заголовке `grpc-message` (`initial_database: field is required`).
+  Без чтения заголовка видно только голый «400» — и следующий шаг делается вслепую.
+- **`initial_database` обязателен.** Минимально достаточное тело создания:
+  `{name, version, instances, specification_id, storage:{pg_data_gb}, subnet_ids:[…], initial_database}`.
+- **`project_id` — только query-параметром.** Без него шлюз отвечает
+  `invalid GetByProjectAndProductRequest.ProjectId: value must be a valid UUID`, даже если проект есть
+  в заголовке `x-project-id`.
 
 ## Managed PostgreSQL: gRPC
 
@@ -110,6 +118,14 @@ delete standard postgres: … service with "FAILED" status may be delete only wi
 Строка «Инстансы Free Tier = 1» существует, но гарантией не является: `POST /v1/clusters` с
 `free_tier=true` (и с `freeTier=true`) принимается с кодом 200, операция стартует, а через секунду
 падает тем же `acquire_quota failed`. Проверять free tier так же, как платный ресурс: одной пробой.
+
+Перепроверено 2026-11-12 в 21:43 МСК: квоты организации те же (Free Tier 1, Инстансы/RAM/vCPU/диски 0),
+проба — `acquire_quota failed`, причём **платный** вариант (без `free_tier`) падает тем же сообщением.
+То есть free tier не «спит» отдельно: не хватает ёмкости пула, и платный заказ не спасает.
+
+Цена пробы: каждая неудачная попытка оставляет кластер в статусе `FAILED`, который `DELETE` не берёт
+(`may be delete only with force flag`) — чистит поддержка. Одна попытка = один объект, поэтому
+проверять одной пробой, а не циклом.
 
 ## Terraform-провайдер
 

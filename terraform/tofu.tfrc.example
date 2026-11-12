@@ -1,0 +1,15 @@
+// Конфигурация CLI для OpenTofu/Terraform: провайдер ставится из локального зеркала,
+// потому что registry.terraform.io доступен не с каждой машины.
+//
+// Скопируйте в tofu.tfrc и поправьте путь. Или соберите зеркало одной командой:
+//   make provider
+provider_installation {
+  filesystem_mirror {
+    path    = "/Users/<you>/.terraform.d/plugins"
+    include = ["registry.terraform.io/cloudru/cloud"]
+  }
+
+  direct {
+    exclude = ["registry.terraform.io/cloudru/cloud"]
+  }
+}

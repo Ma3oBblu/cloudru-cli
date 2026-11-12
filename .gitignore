@@ -1,0 +1,26 @@
+# Секреты и локальное состояние — никогда в git
+.env
+*.env
+.env.*
+!.env.example
+
+# Terraform / OpenTofu
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+tfplan
+tfplan*
+*.auto.tfvars
+crash.log
+
+# ключи и сертификаты
+*.pem
+*.key
+id_rsa
+id_ed25519
+*.pub
+!docs/**/*.pub
+
+# прочее
+.DS_Store

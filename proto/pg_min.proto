@@ -1,0 +1,30 @@
+// Минимальные определения методов ClusterService Cloud.ru Managed PostgreSQL.
+// Нужны потому, что у gRPC-сервера выключена рефлексия, а REST-шлюз не отдаёт
+// действия жизненного цикла (stop/resume): POST на /v1/clusters/{id}/stop он
+// интерпретирует как gRPC-путь и отвечает 415/unknown service.
+//
+// Поля намеренно объявлены «широко»: запросы содержат cluster_id, ответы
+// декодируются как пустые сообщения — нам важен код ответа, а не тело.
+syntax = "proto3";
+
+package cloudru.dbaas.postgresql.v1;
+
+message ClusterRequest {
+  string cluster_id = 1;
+  string project_id = 2;
+}
+
+message OperationResponse {}
+
+message DeleteClusterRequest {
+  string cluster_id = 1;
+  bool force = 2;
+}
+
+service ClusterService {
+  rpc Get(ClusterRequest) returns (OperationResponse);
+  rpc Delete(DeleteClusterRequest) returns (OperationResponse);
+  rpc Suspend(ClusterRequest) returns (OperationResponse);
+  rpc Resume(ClusterRequest) returns (OperationResponse);
+  rpc Switchover(ClusterRequest) returns (OperationResponse);
+}

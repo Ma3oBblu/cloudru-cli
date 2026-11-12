@@ -1,0 +1,10 @@
+// Скопировать в terraform.tfvars и заполнить. Секреты — только через окружение:
+//   export TF_VAR_pg_password='...'      (или в *.auto.tfvars, chmod 600)
+project_id = "00000000-0000-0000-0000-000000000000"
+
+// Необязательное
+# object_storage_tenant_id = ""
+# pg_spec_id               = ""   // `tofu output pg_specs` покажет варианты
+# subnet_id                = ""
+# pg_storage_gb            = 10
+# pg_wal_gb                = 10

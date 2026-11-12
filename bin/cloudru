@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# cloudru — маленький CLI к Cloud.ru Evolution (Managed PostgreSQL + квоты).
+#
+#   cloudru token                 # access-токен (для пайпов и отладки)
+#   cloudru pg list               # кластеры проекта
+#   cloudru pg get <id|name>      # статус, спека, диски, DSN
+#   cloudru pg suspend <id|name>  # остановить (платятся только диски)
+#   cloudru pg resume <id|name>   # запустить
+#   cloudru pg delete <id|name>   # удалить (см. ограничение по FAILED ниже)
+#   cloudru whoami                # проект + срок действия токена
+#
+# Конфигурация (поиск по порядку, первое найденное побеждает):
+#   1. переменные окружения CLOUDRU_KEY_ID / CLOUDRU_SECRET / CLOUDRU_PROJECT_ID
+#      (старые имена AUTH_KEY_ID / AUTH_SECRET поддерживаются)
+#   2. файл ~/.config/cloudru/env (source, chmod 600)
+#
+# Зависимости: curl, python3, grpcurl (только для suspend/resume).
+# Токен берётся на id.cloud.ru: токен с auth.iam.cloud.ru этот API отвергает.
+set -euo pipefail
+
+VERSION="0.1.0"
+PROG="cloudru"
+
+PG_API="https://postgresql.api.cloud.ru"
+PG_GRPC="postgresql.api.cloud.ru:443"
+PG_SVC="cloudru.dbaas.postgresql.v1.ClusterService"
+TOKEN_URL="https://id.cloud.ru/auth/system/openid/token"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cloudru"
+PROTO_DEFAULT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/proto/pg_min.proto"
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+load_config() {
+  if [ -z "${CLOUDRU_KEY_ID:-}" ] && [ -f "$HOME/.config/cloudru/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.config/cloudru/env"
+  fi
+  KEY_ID="${CLOUDRU_KEY_ID:-${AUTH_KEY_ID:-}}"
+  KEY_SECRET="${CLOUDRU_SECRET:-${AUTH_SECRET:-}}"
+  PROJECT="${CLOUDRU_PROJECT_ID:-${TF_VAR_project_id:-}}"
+  [ -n "$KEY_ID" ] || die "нет ключа: задайте CLOUDRU_KEY_ID (или ~/.config/cloudru/env)"
+  [ -n "$KEY_SECRET" ] || die "нет секрета: задайте CLOUDRU_SECRET"
+}
+
+# Токен кэшируется до истечения; exp берём из JWT без верификации подписи.
+token() {
+  mkdir -p "$CACHE"
+  local f="$CACHE/token" now exp
+  now=$(date +%s)
+  if [ -s "$f" ]; then
+    exp=$(sed -n '2p' "$f")
+    if [ -n "$exp" ] && [ "$exp" -gt $((now + 60)) ]; then cat "$f" | sed -n '1p'; return; fi
+  fi
+
+  local raw
+  raw=$(curl -s --fail-with-body \
+    --data-urlencode "grant_type=client_credentials" \
+    --data-urlencode "client_id=$KEY_ID" \
+    --data-urlencode "client_secret=$KEY_SECRET" \
+    "$TOKEN_URL") || die "не удалось получить токен на id.cloud.ru"
+
+  local tok
+  tok=$(printf '%s' "$raw" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("access_token",""))')
+  [ -n "$tok" ] || die "ответ без access_token: $(printf '%s' "$raw" | head -c 200)"
+
+  local expiry
+  expiry=$(printf '%s' "$tok" | python3 -c '
+import sys, json, base64, time
+tok = sys.stdin.read().strip()
+part = tok.split(".")[1]
+part += "=" * (-len(part) % 4)
+payload = json.loads(base64.urlsafe_b64decode(part))
+print(int(payload.get("exp", time.time() + 600)))
+')
+  printf '%s\n%s\n' "$tok" "$expiry" >"$f"
+  chmod 600 "$f"
+  printf '%s\n' "$tok"
+}
+
+# REST-вызов. Особенность шлюза: query-параметры на путях вида /v1/clusters/{id}
+# ломают запрос (415), поэтому проект передаётся заголовком x-project-id.
+rest() {
+  local method="$1" path="$2"
+  mkdir -p "$CACHE"
+  LAST_HDR="$CACHE/last.hdr"
+  curl -s -S -X "$method" -D "$LAST_HDR" \
+    -H "Authorization: Bearer $(token)" \
+    ${PROJECT:+-H "x-project-id: $PROJECT"} \
+    -H "Content-Type: application/json" \
+    -w '\n%{http_code}' "$PG_API$path"
+}
+
+rest_json() {
+  local method="$1" path="$2" out code body detail
+  out=$(rest "$method" "$path") || die "запрос не удался: $method $path"
+  code=$(printf '%s' "$out" | tail -1)
+  body=$(printf '%s' "$out" | sed '$d')
+  case "$code" in
+    200|201) printf '%s' "$body" ;;
+    *)
+      detail=$(grep -i '^grpc-message:' "$CACHE/last.hdr" 2>/dev/null | cut -d' ' -f2- | tr -d '\r' || true)
+      [ -n "$detail" ] || detail=$(printf '%s' "$body" | head -c 300)
+      die "HTTP $code на $method $path: $detail"
+      ;;
+  esac
+}
+
+# gRPC-действия: рефлексия на сервере выключена, поэтому подаём локальный proto.
+grpc_call() {
+  local method="$1" id="$2"
+  have grpcurl || die "нужен grpcurl: brew install grpcurl"
+  local proto="${CLOUDRU_PG_PROTO:-$PROTO_DEFAULT}"
+  [ -f "$proto" ] || die "нет proto: $proto (задайте CLOUDRU_PG_PROTO)"
+  grpcurl -import-path "$(dirname "$proto")" -proto "$(basename "$proto")" \
+    -H "Authorization: Bearer $(token)" \
+    ${PROJECT:+-H "x-project-id: $PROJECT"} \
+    -d "{\"cluster_id\":\"$id\"}" "$PG_GRPC" "$PG_SVC/$method"
+}
+
+require_project() {
+  [ -n "$PROJECT" ] || die "не задан проект: CLOUDRU_PROJECT_ID"
+}
+
+# Имя или id → id. Имена не уникальны (у FAILED-объектов бывают дубли), поэтому
+# при неоднозначности возвращаем ошибку со списком.
+resolve_id() {
+  local want="$1" ids
+  require_project
+  case "$want" in
+    *-*-*-*-*) printf '%s' "$want"; return ;;
+  esac
+  ids=$(rest_json GET "/v1/clusters?project_id=$PROJECT" | python3 -c '
+import sys, json
+want = sys.argv[1]
+data = json.load(sys.stdin).get("clusters", [])
+ids = [c["id"] for c in data if c.get("name") == want]
+print("\n".join(ids))
+' "$want")
+  [ -n "$ids" ] || die "кластер «${want}» не найден"
+  if [ "$(printf '%s\n' "$ids" | wc -l)" -gt 1 ]; then
+    die "имя «${want}» неоднозначно, укажите id: $(printf '%s' "$ids" | tr '\n' ' ')"
+  fi
+  printf '%s' "$ids"
+}
+
+cmd_token() { token; }
+
+cmd_whoami() {
+  require_project
+  token >/dev/null   # прогреть кэш, иначе exp читается из пустого файла
+  local expiry
+  expiry=$(sed -n '2p' "$CACHE/token" 2>/dev/null || echo 0)
+  printf 'project: %s\ntoken exp: %s\n' "$PROJECT" "$(python3 -c "import datetime,sys;print(datetime.datetime.fromtimestamp(int(sys.argv[1])).isoformat())" "${expiry:-0}")"
+}
+
+cmd_pg_list() {
+  require_project
+  rest_json GET "/v1/clusters?project_id=$PROJECT" | python3 -c '
+import sys, json
+rows = json.load(sys.stdin).get("clusters", [])
+if not rows:
+    print("кластеров нет"); raise SystemExit
+w = max(len(c.get("name", "")) for c in rows)
+print("name".ljust(w), " status       version id")
+for c in rows:
+    print(
+        c.get("name", "").ljust(w),
+        c.get("status", "").ljust(12),
+        str(c.get("version", "")).ljust(7),
+        c.get("id", ""),
+    )
+'
+}
+
+cmd_pg_get() {
+  local id
+  id=$(resolve_id "${1:?укажите id или имя}")
+  rest_json GET "/v1/clusters/$id" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("name   :", d.get("name"))
+print("id     :", d.get("id"))
+print("status :", d.get("status"), "| health:", d.get("health"))
+print("version:", d.get("version"), "| spec:", d.get("specification_id"))
+print("storage:", d.get("storage"))
+print("subnets:", d.get("subnet_ids"))
+print("free   :", d.get("free_tier"))
+print("dsn    :", d.get("connection_string") or "(нет — кластер не готов)")
+'
+}
+
+cmd_pg_suspend() { grpc_call Suspend "$(resolve_id "${1:?укажите id или имя}")"; }
+cmd_pg_resume()  { grpc_call Resume  "$(resolve_id "${1:?укажите id или имя}")"; }
+
+cmd_pg_delete() {
+  local id
+  id=$(resolve_id "${1:?укажите id или имя}")
+  # Ограничение площадки: FAILED-объект удаляется только с force-флагом, а он
+  # через REST-шлюз не передаётся (тело/заголовок/query игнорируются или дают 415).
+  rest_json DELETE "/v1/clusters/$id" >/dev/null && echo "удаление принято"
+}
+
+usage() {
+  cat <<EOF
+$PROG $VERSION — CLI к Cloud.ru Evolution (Managed PostgreSQL)
+
+  cloudru token
+  cloudru whoami
+  cloudru pg list
+  cloudru pg get <id|name>
+  cloudru pg suspend <id|name>
+  cloudru pg resume <id|name>
+  cloudru pg delete <id|name>
+
+Конфиг: CLOUDRU_KEY_ID / CLOUDRU_SECRET / CLOUDRU_PROJECT_ID
+        либо ~/.config/cloudru/env (chmod 600)
+EOF
+}
+
+main() {
+  load_config
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    token)  cmd_token ;;
+    whoami) cmd_whoami ;;
+    pg)
+      local sub="${1:-list}"; shift || true
+      case "$sub" in
+        list)    cmd_pg_list ;;
+        get)     cmd_pg_get "$@" ;;
+        suspend) cmd_pg_suspend "$@" ;;
+        resume)  cmd_pg_resume "$@" ;;
+        delete)  cmd_pg_delete "$@" ;;
+        *) die "неизвестная подкоманда pg: $sub" ;;
+      esac
+      ;;
+    help|-h|--help) usage ;;
+    version|--version) echo "$PROG $VERSION" ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
